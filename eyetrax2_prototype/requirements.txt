@@ -1,0 +1,2 @@
+eyetrax @ git+https://github.com/ck-zhang/eyetrax@master
+numpy>=1.26,<2

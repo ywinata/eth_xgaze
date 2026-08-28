@@ -1,0 +1,14 @@
+name: eth_xgaze_prototype
+channels:
+  - conda-forge
+dependencies:
+  - python=3.10
+  - pip
+  - numpy
+  - opencv
+  - dlib
+  - pip:
+      - torch
+      - torchvision
+      - imutils
+      - gdown
