@@ -14,6 +14,8 @@ run.bat --calibrate
 run.bat --emotion
 run.bat --calibrate --emotion
 run.bat --preview
+run.bat --preview --emotion
+run.bat --preview --emotion --emotion-debug
 run.bat --calibrate --calibration-camera-overlay
 ```
 
@@ -32,7 +34,10 @@ run.bat --calibrate --grid-rows 7 --grid-cols 7 --min-samples-per-target 18
 Emotion/facial-expression cue:
 
 ```bat
+python download_emotion_model.py
 run.bat --emotion
+run.bat --preview --emotion
+run.bat --preview --emotion --emotion-debug
 run.bat --emotion --emotion-interval-ms 100
 run.bat --emotion --emotion-interval-ms 300
 ```
@@ -87,10 +92,12 @@ run.bat --calibrate --head-weight 0.35
 | `--feature-mode` | `hybrid` | `gaze`, `hybrid`, `gaze_head` | Gaze-only or gaze plus head-pose features. |
 | `--head-weight` | `0.25` | `0.15`, `0.25`, `0.35` | Head-pose influence in `hybrid` mode. |
 | `--min-eye-open` | `0.16` | `0.14`, `0.16`, `0.20` | Minimum eye-open score for calibration/runtime. |
-| `--emotion` | off | flag | Enables lightweight facial-expression cue. |
-| `--no-emotion` | on | flag | Disables facial-expression cue. |
-| `--emotion-interval-ms` | `200` | `100`, `200`, `300` | Lower is more responsive, higher is lighter. |
-| `--emotion-window` | `5` | `3`, `5`, `7` | Majority-vote smoothing for expression label. |
+| `--emotion` | off | flag | Enables FER+ ONNX emotion detection. |
+| `--no-emotion` | on | flag | Disables emotion detection. |
+| `--emotion-model` | `models\emotion-ferplus-12-int8.onnx` | path | FER+ ONNX model file. |
+| `--emotion-interval-ms` | `150` | `100`, `150`, `300` | Lower is more responsive, higher is lighter. |
+| `--emotion-window` | `1` | `1`, `3`, `5` | Majority-vote smoothing for emotion label. `1` follows the latest frame. |
+| `--emotion-debug` | off | flag | Shows every emotion label probability in preview/status. |
 | `--calibrate` | off | flag | Opens calibration mode. |
 | `--preview` | off | flag | Opens webcam preview window. |
 | `--no-preview` | on | flag | Keeps webcam preview hidden. |
@@ -121,8 +128,14 @@ Lighter runtime:
 run.bat --width 424 --height 240 --no-preview --no-emotion
 ```
 
-Expression cue, still laptop-friendly:
+Emotion detection, responsive default:
 
 ```bat
-run.bat --emotion --emotion-interval-ms 200 --emotion-window 5
+run.bat --emotion --emotion-interval-ms 150 --emotion-window 1
+```
+
+Emotion labels:
+
+```text
+neutral, happy, surprise, sad, angry, disgust, fear, contempt
 ```

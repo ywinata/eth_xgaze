@@ -16,6 +16,7 @@ C:\Users\ywinata_kadence\Documents\CV Code\eth-xgaze
 conda env create -f environment.yml
 conda activate eth_xgaze_prototype
 python download_checkpoint.py
+python download_emotion_model.py
 python app.py --calibrate
 ```
 
@@ -67,6 +68,8 @@ run.bat --calibrate --calibration-bg white
 run.bat --calibrate --calibration-camera-overlay
 run.bat --preview
 run.bat --emotion
+run.bat --preview --emotion
+run.bat --preview --emotion --emotion-debug
 run.bat --emotion --emotion-interval-ms 100
 ```
 
@@ -103,12 +106,14 @@ Calibration samples are collected only when the face is detected, ETH-XGaze runs
 and both eyes are open enough. If normal open eyes are rejected too often, lower
 the threshold slightly with `--min-eye-open 0.14`.
 
-Optional facial-expression cues are off by default to keep gaze estimation
-smooth. Enable the lightweight landmark-based mode with `--emotion`; it updates
-at most every `200 ms` by default. Use `--emotion-interval-ms 100` for stronger
-PCs or `--emotion-interval-ms 300` if the laptop feels heavy. This reports simple
-expression cues such as `neutral`, `smile`, `mouth open`, and `squint`; it is not
-a full emotion model.
+Optional emotion detection is off by default to keep gaze estimation smooth.
+Enable the lightweight FER+ ONNX mode with `--emotion`; it updates at most every
+`150 ms` by default. Use `--emotion-interval-ms 100` for stronger PCs or
+`--emotion-interval-ms 300` if the laptop feels heavy. Labels are `neutral`,
+`happy`, `surprise`, `sad`, `angry`, `disgust`, `fear`, and `contempt`.
+By default the UI shows the latest winning label without majority smoothing; add
+`--emotion-debug` to show all label probabilities in the preview/status for
+tuning.
 
 If calibration says `face not detected`, make sure the physical camera switch is
 on, try brighter front lighting, keep your face centered in the webcam, or run

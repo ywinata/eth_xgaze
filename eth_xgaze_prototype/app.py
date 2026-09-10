@@ -42,6 +42,8 @@ from torchvision import transforms
 ETH_XGAZE_DIR = Path(r"C:\Users\ywinata_kadence\Documents\CV Code\eth-xgaze")
 CHECKPOINT = ETH_XGAZE_DIR / "ckpt" / "epoch_24_ckpt.pth.tar"
 CALIBRATION_FILE = Path("eth_xgaze_screen_calibration.json")
+EMOTION_MODEL = Path("models") / "emotion-ferplus-12-int8.onnx"
+EMOTION_LABELS = ("neutral", "happy", "surprise", "sad", "angry", "disgust", "fear", "contempt")
 MODEL_VERSION = 4
 PREVIEW_WINDOW = "ETH-XGaze camera preview"
 
@@ -201,19 +203,6 @@ class EthXGazeCore:
 
         return min(ear(landmarks[36:42]), ear(landmarks[42:48]))
 
-    @staticmethod
-    def expression_label(landmarks: np.ndarray, eye_quality: float) -> str:
-        face_width = max(float(np.linalg.norm(landmarks[0] - landmarks[16])), 1e-6)
-        mouth_width = float(np.linalg.norm(landmarks[48] - landmarks[54])) / face_width
-        mouth_open = float(np.linalg.norm(landmarks[62] - landmarks[66])) / max(float(np.linalg.norm(landmarks[48] - landmarks[54])), 1e-6)
-        if mouth_open > 0.24:
-            return "mouth open"
-        if mouth_width > 0.36 and mouth_open < 0.14:
-            return "smile"
-        if eye_quality < 0.20:
-            return "squint"
-        return "neutral"
-
     def _normalize_face(self, img: np.ndarray, landmarks: np.ndarray, rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
         focal_norm = 960
         distance_norm = 600
@@ -248,6 +237,34 @@ class EthXGazeCore:
         cv2.arrowedLine(frame, center, (int(center[0] + dx), int(center[1] + dy)), (0, 0, 255), 2, cv2.LINE_AA, tipLength=0.2)
 
 
+class EmotionRecognizer:
+    def __init__(self, model_path: Path) -> None:
+        if not model_path.exists():
+            raise FileNotFoundError(f"Emotion model not found: {model_path}")
+        import onnxruntime as ort
+
+        self.session = ort.InferenceSession(str(model_path), providers=["CPUExecutionProvider"])
+        self.input_name = self.session.get_inputs()[0].name
+
+    def predict(self, frame: np.ndarray, face: dlib.rectangle) -> tuple[str, float, dict[str, float]]:
+        h, w = frame.shape[:2]
+        pad = int(max(face.width(), face.height()) * 0.18)
+        x1 = max(0, face.left() - pad)
+        y1 = max(0, face.top() - pad)
+        x2 = min(w, face.right() + pad)
+        y2 = min(h, face.bottom() + pad)
+        crop = frame[y1:y2, x1:x2]
+        if crop.size == 0:
+            return "unknown", 0.0, {}
+        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
+        image = cv2.resize(gray, (64, 64), interpolation=cv2.INTER_AREA).astype(np.float32).reshape(1, 1, 64, 64)
+        scores = self.session.run(None, {self.input_name: image})[0][0]
+        scores = scores - np.max(scores)
+        probs = np.exp(scores) / np.sum(np.exp(scores))
+        index = int(np.argmax(probs))
+        return EMOTION_LABELS[index], float(probs[index]), {label: float(probs[i]) for i, label in enumerate(EMOTION_LABELS)}
+
+
 class App:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -269,11 +286,20 @@ class App:
         )
         self.pointer = PointerWindow(self.root, args.pointer_size)
         self.status = tk.StringVar(value="Calibrate first.")
+        self.emotion: Optional[EmotionRecognizer] = None
+        self.emotion_error = ""
+        if args.emotion:
+            try:
+                self.emotion = EmotionRecognizer(Path(args.emotion_model))
+            except Exception as exc:
+                self.emotion_error = f"Emotion unavailable: {exc}"
         self.feature_mean: Optional[np.ndarray] = None
         self.feature_std: Optional[np.ndarray] = None
         self.weights: Optional[np.ndarray] = self.load_calibration()
         if self.weights is not None:
             self.status.set("ETH-XGaze calibration loaded.")
+        if self.emotion_error:
+            self.status.set(self.emotion_error)
         tk.Label(self.root, text="ETH-XGaze Prototype", font=("Segoe UI", 13, "bold")).pack(pady=(12, 4))
         tk.Label(self.root, textvariable=self.status, wraplength=380).pack()
         tk.Button(self.root, text="Calibrate", command=self.start_calibration).pack(side=tk.LEFT, padx=32, pady=18)
@@ -291,6 +317,8 @@ class App:
         self.last_emotion_at = 0.0
         self.emotion_labels: deque[str] = deque(maxlen=args.emotion_window)
         self.emotion_label = "off"
+        self.emotion_confidence = 0.0
+        self.emotion_probs: dict[str, float] = {}
         self.camera_image = None
         if args.calibrate:
             self.root.after(500, self.start_calibration)
@@ -508,9 +536,21 @@ class App:
             frame = cv2.flip(frame, 1)
             self.handle_frame(frame)
             if not self.args.no_preview and not self.calibration_screen:
+                self.draw_preview_overlay(frame)
                 cv2.imshow(PREVIEW_WINDOW, frame)
                 cv2.waitKey(1)
         self.root.after(16, self.tick)
+
+    def draw_preview_overlay(self, frame: np.ndarray) -> None:
+        if self.emotion is None:
+            return
+        lines = [f"emotion: {self.emotion_label}"]
+        if self.args.emotion_debug and self.emotion_probs:
+            lines.extend(f"{label}: {self.emotion_probs[label]:.0%}" for label in EMOTION_LABELS)
+        height = 18 + 25 * len(lines)
+        cv2.rectangle(frame, (8, 8), (260, height), (0, 0, 0), -1)
+        for i, text in enumerate(lines):
+            cv2.putText(frame, text, (16, 32 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 255, 255), 2, cv2.LINE_AA)
 
     def handle_frame(self, frame: np.ndarray) -> None:
         result = self.core.estimate(frame)
@@ -542,11 +582,11 @@ class App:
             self.pointer.hide()
             self.status.set(f"Eyes not open enough: {result[4]:.3f} / {self.args.min_eye_open:.3f}")
             return
+        expression = self.update_emotion(frame, result[2])
         if not self.has_calibration():
             self.pointer.hide()
             self.status.set("No screen calibration. Click Calibrate.")
             return
-        expression = self.update_emotion(result[5], result[4])
         row = self.design(self.normalize_features(self.select_features(result[0], self.args.feature_mode)))[0]
         x, y = row @ self.weights
         x = int(min(max(x, 0), self.screen_w - 1))
@@ -557,18 +597,26 @@ class App:
             y = int(np.median([p[1] for p in self.history]))
         x, y = self.smooth(x, y)
         self.pointer.move(x, y)
-        suffix = f" | expression: {expression}" if expression else ""
+        suffix = f" | emotion: {self.format_emotion_status(expression)}" if expression else ""
         self.status.set(f"ETH-XGaze pitch/yaw: {result[1][0]:+.3f}, {result[1][1]:+.3f} ({result[3]}) -> x={x} y={y}{suffix}")
 
-    def update_emotion(self, landmarks: np.ndarray, eye_quality: float) -> str:
-        if not self.args.emotion:
+    def update_emotion(self, frame: np.ndarray, face: dlib.rectangle) -> str:
+        if self.emotion is None:
             return ""
         now = time.time()
         if (now - self.last_emotion_at) * 1000.0 >= self.args.emotion_interval_ms:
             self.last_emotion_at = now
-            self.emotion_labels.append(self.core.expression_label(landmarks, eye_quality))
+            label, confidence, probs = self.emotion.predict(frame, face)
+            self.emotion_confidence = confidence
+            self.emotion_probs = probs
+            self.emotion_labels.append(label)
             self.emotion_label = Counter(self.emotion_labels).most_common(1)[0][0]
         return self.emotion_label
+
+    def format_emotion_status(self, label: str) -> str:
+        if not self.args.emotion_debug or not self.emotion_probs:
+            return label
+        return ", ".join(f"{name} {self.emotion_probs[name]:.0%}" for name in EMOTION_LABELS)
 
     def trim(self, samples: list[np.ndarray]) -> list[np.ndarray]:
         x = np.vstack(samples)
@@ -619,8 +667,10 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(emotion=False)
     parser.add_argument("--emotion", action="store_true")
     parser.add_argument("--no-emotion", dest="emotion", action="store_false")
-    parser.add_argument("--emotion-interval-ms", type=int, default=200)
-    parser.add_argument("--emotion-window", type=int, default=5)
+    parser.add_argument("--emotion-model", default=str(EMOTION_MODEL))
+    parser.add_argument("--emotion-interval-ms", type=int, default=150)
+    parser.add_argument("--emotion-window", type=int, default=1)
+    parser.add_argument("--emotion-debug", action="store_true")
     parser.add_argument("--calibrate", action="store_true")
     parser.set_defaults(no_preview=True)
     parser.add_argument("--preview", dest="no_preview", action="store_false")

@@ -12,3 +12,4 @@ dependencies:
       - torchvision
       - imutils
       - gdown
+      - onnxruntime
