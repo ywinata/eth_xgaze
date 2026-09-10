@@ -66,6 +66,8 @@ run.bat --calibrate --face-upsample 2
 run.bat --calibrate --calibration-bg white
 run.bat --calibrate --calibration-camera-overlay
 run.bat --preview
+run.bat --emotion
+run.bat --emotion --emotion-interval-ms 100
 ```
 
 ## Calibration Notes
@@ -100,6 +102,13 @@ target.
 Calibration samples are collected only when the face is detected, ETH-XGaze runs,
 and both eyes are open enough. If normal open eyes are rejected too often, lower
 the threshold slightly with `--min-eye-open 0.14`.
+
+Optional facial-expression cues are off by default to keep gaze estimation
+smooth. Enable the lightweight landmark-based mode with `--emotion`; it updates
+at most every `200 ms` by default. Use `--emotion-interval-ms 100` for stronger
+PCs or `--emotion-interval-ms 300` if the laptop feels heavy. This reports simple
+expression cues such as `neutral`, `smile`, `mouth open`, and `squint`; it is not
+a full emotion model.
 
 If calibration says `face not detected`, make sure the physical camera switch is
 on, try brighter front lighting, keep your face centered in the webcam, or run

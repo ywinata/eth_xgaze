@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from collections import deque
+from collections import Counter, deque
 from pathlib import Path
 from typing import Optional
 
@@ -170,7 +170,7 @@ class EthXGazeCore:
                 return dlib.rectangle(int(x), int(y), int(x + w), int(y + h)), "cv2"
         return None
 
-    def estimate(self, frame: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray, dlib.rectangle, str, float]]:
+    def estimate(self, frame: np.ndarray) -> Optional[tuple[np.ndarray, np.ndarray, dlib.rectangle, str, float, np.ndarray]]:
         detection = self.detect_face(frame)
         if detection is None:
             return None
@@ -190,7 +190,7 @@ class EthXGazeCore:
             gaze = self.model(tensor)[0].cpu().numpy().astype(np.float32)
         self._draw_debug(frame, shape, gaze)
         pose = np.concatenate([rvec.reshape(-1).astype(np.float32), tvec.reshape(-1).astype(np.float32)])
-        return np.concatenate([gaze, pose]), gaze, face, detector_name, eye_quality
+        return np.concatenate([gaze, pose]), gaze, face, detector_name, eye_quality, shape
 
     @staticmethod
     def eye_open_quality(landmarks: np.ndarray) -> float:
@@ -200,6 +200,19 @@ class EthXGazeCore:
             return float(vertical / horizontal)
 
         return min(ear(landmarks[36:42]), ear(landmarks[42:48]))
+
+    @staticmethod
+    def expression_label(landmarks: np.ndarray, eye_quality: float) -> str:
+        face_width = max(float(np.linalg.norm(landmarks[0] - landmarks[16])), 1e-6)
+        mouth_width = float(np.linalg.norm(landmarks[48] - landmarks[54])) / face_width
+        mouth_open = float(np.linalg.norm(landmarks[62] - landmarks[66])) / max(float(np.linalg.norm(landmarks[48] - landmarks[54])), 1e-6)
+        if mouth_open > 0.24:
+            return "mouth open"
+        if mouth_width > 0.36 and mouth_open < 0.14:
+            return "smile"
+        if eye_quality < 0.20:
+            return "squint"
+        return "neutral"
 
     def _normalize_face(self, img: np.ndarray, landmarks: np.ndarray, rvec: np.ndarray, tvec: np.ndarray) -> np.ndarray:
         focal_norm = 960
@@ -256,6 +269,8 @@ class App:
         )
         self.pointer = PointerWindow(self.root, args.pointer_size)
         self.status = tk.StringVar(value="Calibrate first.")
+        self.feature_mean: Optional[np.ndarray] = None
+        self.feature_std: Optional[np.ndarray] = None
         self.weights: Optional[np.ndarray] = self.load_calibration()
         if self.weights is not None:
             self.status.set("ETH-XGaze calibration loaded.")
@@ -273,8 +288,9 @@ class App:
         self.labels: list[list[int]] = []
         self.history: deque[tuple[int, int]] = deque(maxlen=args.median_window)
         self.smoothed: Optional[tuple[float, float]] = None
-        self.feature_mean: Optional[np.ndarray] = None
-        self.feature_std: Optional[np.ndarray] = None
+        self.last_emotion_at = 0.0
+        self.emotion_labels: deque[str] = deque(maxlen=args.emotion_window)
+        self.emotion_label = "off"
         self.camera_image = None
         if args.calibrate:
             self.root.after(500, self.start_calibration)
@@ -325,6 +341,9 @@ class App:
         self.feature_mean = np.array(data["feature_mean"], dtype=np.float32)
         self.feature_std = np.array(data["feature_std"], dtype=np.float32)
         return np.array(data["weights"], dtype=np.float32)
+
+    def has_calibration(self) -> bool:
+        return self.weights is not None and self.feature_mean is not None and self.feature_std is not None
 
     def save_calibration(self) -> None:
         data = {
@@ -523,10 +542,11 @@ class App:
             self.pointer.hide()
             self.status.set(f"Eyes not open enough: {result[4]:.3f} / {self.args.min_eye_open:.3f}")
             return
-        if self.weights is None:
+        if not self.has_calibration():
             self.pointer.hide()
             self.status.set("No screen calibration. Click Calibrate.")
             return
+        expression = self.update_emotion(result[5], result[4])
         row = self.design(self.normalize_features(self.select_features(result[0], self.args.feature_mode)))[0]
         x, y = row @ self.weights
         x = int(min(max(x, 0), self.screen_w - 1))
@@ -537,7 +557,18 @@ class App:
             y = int(np.median([p[1] for p in self.history]))
         x, y = self.smooth(x, y)
         self.pointer.move(x, y)
-        self.status.set(f"ETH-XGaze pitch/yaw: {result[1][0]:+.3f}, {result[1][1]:+.3f} ({result[3]}) -> x={x} y={y}")
+        suffix = f" | expression: {expression}" if expression else ""
+        self.status.set(f"ETH-XGaze pitch/yaw: {result[1][0]:+.3f}, {result[1][1]:+.3f} ({result[3]}) -> x={x} y={y}{suffix}")
+
+    def update_emotion(self, landmarks: np.ndarray, eye_quality: float) -> str:
+        if not self.args.emotion:
+            return ""
+        now = time.time()
+        if (now - self.last_emotion_at) * 1000.0 >= self.args.emotion_interval_ms:
+            self.last_emotion_at = now
+            self.emotion_labels.append(self.core.expression_label(landmarks, eye_quality))
+            self.emotion_label = Counter(self.emotion_labels).most_common(1)[0][0]
+        return self.emotion_label
 
     def trim(self, samples: list[np.ndarray]) -> list[np.ndarray]:
         x = np.vstack(samples)
@@ -585,6 +616,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--feature-mode", choices=["gaze", "hybrid", "gaze_head"], default="hybrid")
     parser.add_argument("--head-weight", type=float, default=0.25)
     parser.add_argument("--min-eye-open", type=float, default=0.16)
+    parser.set_defaults(emotion=False)
+    parser.add_argument("--emotion", action="store_true")
+    parser.add_argument("--no-emotion", dest="emotion", action="store_false")
+    parser.add_argument("--emotion-interval-ms", type=int, default=200)
+    parser.add_argument("--emotion-window", type=int, default=5)
     parser.add_argument("--calibrate", action="store_true")
     parser.set_defaults(no_preview=True)
     parser.add_argument("--preview", dest="no_preview", action="store_false")
