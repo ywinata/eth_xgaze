@@ -44,6 +44,7 @@ CHECKPOINT = ETH_XGAZE_DIR / "ckpt" / "epoch_24_ckpt.pth.tar"
 CALIBRATION_FILE = Path("eth_xgaze_screen_calibration.json")
 EMOTION_MODEL = Path("models") / "emotion-ferplus-12-int8.onnx"
 EMOTION_LABELS = ("neutral", "happy", "surprise", "sad", "angry", "disgust", "fear", "contempt")
+NEGATIVE_EMOTION_LABELS = ("sad", "angry", "disgust", "fear")
 MODEL_VERSION = 4
 PREVIEW_WINDOW = "ETH-XGaze camera preview"
 
@@ -116,7 +117,9 @@ class EthXGazeModel(nn.Module):
 class EthXGazeCore:
     def __init__(self, eth_dir: Path, checkpoint: Path, device: str, width: int, height: int, face_upsample: int) -> None:
         self.eth_dir = eth_dir
-        self.device = torch.device(device if device == "cuda" and torch.cuda.is_available() else "cpu")
+        self.requested_device = device
+        self.device = self.resolve_device(device)
+        self.device_note = f"{device} -> {self.device.type}" if device != self.device.type else self.device.type
         self.face_upsample = face_upsample
         self._verify_files(checkpoint)
         self.detector = dlib.get_frontal_face_detector()
@@ -138,6 +141,14 @@ class EthXGazeCore:
                 transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
             ]
         )
+
+    @staticmethod
+    def resolve_device(device: str) -> torch.device:
+        if device == "auto":
+            return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device == "cuda" and not torch.cuda.is_available():
+            return torch.device("cpu")
+        return torch.device(device)
 
     def _verify_files(self, checkpoint: Path) -> None:
         missing = [
@@ -265,6 +276,46 @@ class EmotionRecognizer:
         return EMOTION_LABELS[index], float(probs[index]), {label: float(probs[i]) for i, label in enumerate(EMOTION_LABELS)}
 
 
+class LandmarkExpressionIntensity:
+    ANCHORS = np.array([27, 28, 29, 30, 31, 35, 36, 39, 42, 45])
+    REGIONS = {
+        "brow": np.arange(17, 27),
+        "eye": np.arange(36, 48),
+        "mouth": np.arange(48, 68),
+    }
+
+    def __init__(self, baseline_frames: int) -> None:
+        self.baseline_frames = max(1, baseline_frames)
+        self.samples: deque[np.ndarray] = deque(maxlen=self.baseline_frames)
+        self.baseline: Optional[np.ndarray] = None
+        self.face_width = 1.0
+        self.last_scores: dict[str, float] = {}
+
+    def reset(self) -> None:
+        self.samples.clear()
+        self.baseline = None
+        self.face_width = 1.0
+        self.last_scores = {}
+
+    def update(self, landmarks: np.ndarray) -> dict[str, float]:
+        points = landmarks.astype(np.float32)
+        if self.baseline is None:
+            self.samples.append(points)
+            if len(self.samples) == self.samples.maxlen:
+                self.baseline = np.median(np.stack(self.samples), axis=0).astype(np.float32)
+                self.face_width = max(float(np.linalg.norm(self.baseline[0] - self.baseline[16])), 1.0)
+            self.last_scores = {"ready": 0.0, "progress": len(self.samples) / float(self.samples.maxlen)}
+            return self.last_scores
+
+        affine, _ = cv2.estimateAffinePartial2D(points[self.ANCHORS], self.baseline[self.ANCHORS], method=cv2.LMEDS)
+        aligned = cv2.transform(points.reshape(1, -1, 2), affine).reshape(-1, 2) if affine is not None else points
+        residual = np.linalg.norm(aligned - self.baseline, axis=1) / self.face_width
+        scores = {"ready": 1.0, "overall": float(np.mean(residual[17:68]))}
+        scores.update({name: float(np.mean(residual[indexes])) for name, indexes in self.REGIONS.items()})
+        self.last_scores = scores
+        return scores
+
+
 class App:
     def __init__(self, args: argparse.Namespace) -> None:
         self.args = args
@@ -285,7 +336,7 @@ class App:
             args.face_upsample,
         )
         self.pointer = PointerWindow(self.root, args.pointer_size)
-        self.status = tk.StringVar(value="Calibrate first.")
+        self.status = tk.StringVar(value=f"Calibrate first. Device: {self.core.device_note}.")
         self.emotion: Optional[EmotionRecognizer] = None
         self.emotion_error = ""
         if args.emotion:
@@ -297,7 +348,7 @@ class App:
         self.feature_std: Optional[np.ndarray] = None
         self.weights: Optional[np.ndarray] = self.load_calibration()
         if self.weights is not None:
-            self.status.set("ETH-XGaze calibration loaded.")
+            self.status.set(f"ETH-XGaze calibration loaded. Device: {self.core.device_note}.")
         if self.emotion_error:
             self.status.set(self.emotion_error)
         tk.Label(self.root, text="ETH-XGaze Prototype", font=("Segoe UI", 13, "bold")).pack(pady=(12, 4))
@@ -305,6 +356,7 @@ class App:
         tk.Button(self.root, text="Calibrate", command=self.start_calibration).pack(side=tk.LEFT, padx=32, pady=18)
         tk.Button(self.root, text="Quit", command=self.stop).pack(side=tk.RIGHT, padx=32, pady=18)
         self.calibration_screen: Optional[tk.Toplevel] = None
+        self.calibration_phase = "gaze"
         self.canvas: Optional[tk.Canvas] = None
         self.targets: list[tuple[int, int]] = []
         self.target_index = -1
@@ -319,6 +371,18 @@ class App:
         self.emotion_label = "off"
         self.emotion_confidence = 0.0
         self.emotion_probs: dict[str, float] = {}
+        self.emotion_intensity = 0.0
+        self.emotion_positive = 0.0
+        self.emotion_negative = 0.0
+        self.emotion_valence = 0.0
+        self.emotion_intensity_delta = 0.0
+        self.emotion_valence_delta = 0.0
+        self.emotion_baseline_samples: list[dict[str, float]] = []
+        self.emotion_baseline_probs: dict[str, float] = {}
+        self.expression_intensity: Optional[LandmarkExpressionIntensity] = (
+            LandmarkExpressionIntensity(args.expression_baseline_frames) if args.expression_intensity else None
+        )
+        self.expression_scores: dict[str, float] = {}
         self.camera_image = None
         if args.calibrate:
             self.root.after(500, self.start_calibration)
@@ -414,11 +478,52 @@ class App:
         self.canvas.place(x=0, y=0, width=self.screen_w, height=self.screen_h)
         self.calibration_screen.grab_set()
         self.target_index = -1
-        self.next_target()
+        if self.needs_neutral_baseline():
+            if self.expression_intensity is not None:
+                self.expression_intensity.reset()
+            self.expression_scores = {}
+            self.reset_emotion_baseline()
+            self.calibration_phase = "expression_baseline"
+            self.draw_expression_baseline(False)
+        else:
+            self.calibration_phase = "gaze"
+            self.next_target()
         self.calibration_screen.lift()
         self.calibration_screen.focus_force()
         self.calibration_screen.update_idletasks()
         self.calibration_screen.update()
+
+    def draw_expression_baseline(self, valid: bool, eye_quality: float = 0.0, detector_name: str = "") -> None:
+        if not self.canvas:
+            return
+        self.canvas.delete("all")
+        text_color = "#cbd5e1" if self.args.calibration_bg == "black" else "#1f2937"
+        status_color = "#6ee7ff" if valid and self.args.calibration_bg == "black" else ("#0369a1" if valid else "#dc2626")
+        progress = self.neutral_baseline_progress()
+        cx, cy = self.screen_w // 2, self.screen_h // 2
+        self.canvas.create_oval(cx - 12, cy - 12, cx + 12, cy + 12, fill="#38bdf8", outline="white", width=2)
+        self.canvas.create_text(cx, 72, text="Neutral baseline", fill=text_color, font=("Segoe UI", 18, "bold"))
+        self.canvas.create_text(
+            cx,
+            118,
+            text="Look at the center, keep your head still, relax your face.",
+            fill=text_color,
+            font=("Segoe UI", 13),
+        )
+        self.canvas.create_rectangle(cx - 180, cy + 42, cx + 180, cy + 62, outline=text_color, width=2)
+        self.canvas.create_rectangle(cx - 178, cy + 44, cx - 178 + int(356 * progress), cy + 60, fill="#22c55e", outline="")
+        self.canvas.create_text(
+            26,
+            self.screen_h - 82,
+            text=(
+                f"baseline: {progress:.0%}\n"
+                f"eye-open: {eye_quality:.3f} / {self.args.min_eye_open:.3f}\n"
+                f"{f'face/gaze ok ({detector_name})' if valid else 'face/gaze/eyes not ready'}"
+            ),
+            fill=status_color,
+            font=("Consolas", 14, "bold"),
+            anchor="w",
+        )
 
     def build_targets(self) -> list[tuple[int, int]]:
         mx = int(self.screen_w * self.args.grid_margin)
@@ -542,13 +647,31 @@ class App:
         self.root.after(16, self.tick)
 
     def draw_preview_overlay(self, frame: np.ndarray) -> None:
-        if self.emotion is None:
+        if self.emotion is None and self.expression_intensity is None:
             return
-        lines = [f"emotion: {self.emotion_label}"]
-        if self.args.emotion_debug and self.emotion_probs:
+        lines = []
+        if self.emotion is not None:
+            lines.append(f"emotion: {self.emotion_label}")
+            lines.append(f"emotion intensity: {self.emotion_intensity:.0%}")
+            if self.emotion_baseline_probs:
+                lines.append(f"emotion delta: {self.emotion_intensity_delta:+.0%}")
+        if self.emotion is not None and self.args.emotion_debug and self.emotion_probs:
+            lines.extend(
+                [
+                    f"positive: {self.emotion_positive:.0%}",
+                    f"negative: {self.emotion_negative:.0%}",
+                    f"valence: {self.emotion_valence:+.2f}",
+                    f"valence delta: {self.emotion_valence_delta:+.2f}",
+                ]
+            )
             lines.extend(f"{label}: {self.emotion_probs[label]:.0%}" for label in EMOTION_LABELS)
+        if self.expression_intensity is not None:
+            lines.extend(self.format_expression_lines())
+        if not lines:
+            return
+        width = 360 if self.expression_intensity is not None else 260
         height = 18 + 25 * len(lines)
-        cv2.rectangle(frame, (8, 8), (260, height), (0, 0, 0), -1)
+        cv2.rectangle(frame, (8, 8), (width, height), (0, 0, 0), -1)
         for i, text in enumerate(lines):
             cv2.putText(frame, text, (16, 32 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 255, 255), 2, cv2.LINE_AA)
 
@@ -559,6 +682,20 @@ class App:
             elapsed = time.time() - self.target_started
             eye_quality = result[4] if result is not None else 0.0
             valid_sample = valid and eye_quality >= self.args.min_eye_open
+            if self.calibration_phase == "expression_baseline":
+                if valid_sample:
+                    if self.expression_intensity is not None:
+                        self.update_expression_intensity(result[5])
+                    self.update_emotion_baseline(frame, result[2])
+                    self.draw_expression_baseline(True, eye_quality, result[3])
+                    if self.neutral_baseline_ready():
+                        self.finish_emotion_baseline()
+                        self.calibration_phase = "gaze"
+                        self.next_target()
+                    return
+                face = self.core.detect_face(frame)
+                self.draw_expression_baseline(False, eye_quality, face[1] if face else "")
+                return
             if not valid_sample:
                 self.target_started = time.time()
                 face = self.core.detect_face(frame)
@@ -583,9 +720,11 @@ class App:
             self.status.set(f"Eyes not open enough: {result[4]:.3f} / {self.args.min_eye_open:.3f}")
             return
         expression = self.update_emotion(frame, result[2])
+        self.update_expression_intensity(result[5])
         if not self.has_calibration():
             self.pointer.hide()
-            self.status.set("No screen calibration. Click Calibrate.")
+            suffix = self.format_expression_status()
+            self.status.set(f"No screen calibration. Click Calibrate.{suffix}")
             return
         row = self.design(self.normalize_features(self.select_features(result[0], self.args.feature_mode)))[0]
         x, y = row @ self.weights
@@ -598,6 +737,7 @@ class App:
         x, y = self.smooth(x, y)
         self.pointer.move(x, y)
         suffix = f" | emotion: {self.format_emotion_status(expression)}" if expression else ""
+        suffix += self.format_expression_status()
         self.status.set(f"ETH-XGaze pitch/yaw: {result[1][0]:+.3f}, {result[1][1]:+.3f} ({result[3]}) -> x={x} y={y}{suffix}")
 
     def update_emotion(self, frame: np.ndarray, face: dlib.rectangle) -> str:
@@ -609,14 +749,102 @@ class App:
             label, confidence, probs = self.emotion.predict(frame, face)
             self.emotion_confidence = confidence
             self.emotion_probs = probs
+            self.update_emotion_intensity()
             self.emotion_labels.append(label)
             self.emotion_label = Counter(self.emotion_labels).most_common(1)[0][0]
         return self.emotion_label
 
     def format_emotion_status(self, label: str) -> str:
         if not self.args.emotion_debug or not self.emotion_probs:
-            return label
-        return ", ".join(f"{name} {self.emotion_probs[name]:.0%}" for name in EMOTION_LABELS)
+            return f"{label}, model intensity {self.format_percent_delta(self.emotion_intensity, self.emotion_intensity_delta)}"
+        probs = ", ".join(f"{name} {self.emotion_probs[name]:.0%}" for name in EMOTION_LABELS)
+        return (
+            f"{label}, model intensity {self.format_percent_delta(self.emotion_intensity, self.emotion_intensity_delta)}, "
+            f"valence {self.emotion_valence:+.2f} ({self.emotion_valence_delta:+.2f}), {probs}"
+        )
+
+    def update_emotion_intensity(self) -> None:
+        neutral = self.emotion_probs.get("neutral", 0.0)
+        self.emotion_intensity = max(0.0, min(1.0, 1.0 - neutral))
+        self.emotion_positive = self.emotion_probs.get("happy", 0.0)
+        self.emotion_negative = sum(self.emotion_probs.get(label, 0.0) for label in NEGATIVE_EMOTION_LABELS)
+        self.emotion_valence = self.emotion_positive - self.emotion_negative
+        if self.emotion_baseline_probs:
+            baseline_intensity = 1.0 - self.emotion_baseline_probs.get("neutral", 0.0)
+            baseline_positive = self.emotion_baseline_probs.get("happy", 0.0)
+            baseline_negative = sum(self.emotion_baseline_probs.get(label, 0.0) for label in NEGATIVE_EMOTION_LABELS)
+            self.emotion_intensity_delta = self.emotion_intensity - baseline_intensity
+            self.emotion_valence_delta = self.emotion_valence - (baseline_positive - baseline_negative)
+        else:
+            self.emotion_intensity_delta = 0.0
+            self.emotion_valence_delta = 0.0
+
+    def needs_neutral_baseline(self) -> bool:
+        return self.expression_intensity is not None or self.emotion is not None
+
+    def reset_emotion_baseline(self) -> None:
+        self.emotion_baseline_samples = []
+        self.emotion_baseline_probs = {}
+        self.emotion_intensity_delta = 0.0
+        self.emotion_valence_delta = 0.0
+
+    def update_emotion_baseline(self, frame: np.ndarray, face: dlib.rectangle) -> None:
+        if self.emotion is None or len(self.emotion_baseline_samples) >= self.args.expression_baseline_frames:
+            return
+        _label, _confidence, probs = self.emotion.predict(frame, face)
+        self.emotion_baseline_samples.append(probs)
+
+    def finish_emotion_baseline(self) -> None:
+        if not self.emotion_baseline_samples:
+            return
+        self.emotion_baseline_probs = {
+            label: float(np.median([sample.get(label, 0.0) for sample in self.emotion_baseline_samples]))
+            for label in EMOTION_LABELS
+        }
+
+    def neutral_baseline_progress(self) -> float:
+        progresses = []
+        if self.expression_intensity is not None:
+            progresses.append(self.expression_scores.get("progress", 1.0 if self.expression_scores.get("ready", 0.0) else 0.0))
+        if self.emotion is not None:
+            progresses.append(min(1.0, len(self.emotion_baseline_samples) / float(max(1, self.args.expression_baseline_frames))))
+        return min(progresses) if progresses else 1.0
+
+    def neutral_baseline_ready(self) -> bool:
+        expression_ready = self.expression_intensity is None or bool(self.expression_scores.get("ready", 0.0))
+        emotion_ready = self.emotion is None or len(self.emotion_baseline_samples) >= self.args.expression_baseline_frames
+        return expression_ready and emotion_ready
+
+    @staticmethod
+    def format_percent_delta(value: float, delta: float) -> str:
+        return f"{value:.0%} ({delta:+.0%})"
+
+    def update_expression_intensity(self, landmarks: np.ndarray) -> None:
+        if self.expression_intensity is not None:
+            self.expression_scores = self.expression_intensity.update(landmarks)
+
+    def format_expression_status(self) -> str:
+        if self.expression_intensity is None or not self.expression_scores:
+            return ""
+        if not self.expression_scores.get("ready", 0.0):
+            return f" | expression baseline {self.expression_scores.get('progress', 0.0):.0%}"
+        return f" | intensity {self.expression_scores['overall']:.3f}"
+
+    def format_expression_lines(self) -> list[str]:
+        if not self.expression_scores:
+            return ["intensity: waiting"]
+        if not self.expression_scores.get("ready", 0.0):
+            return [f"intensity baseline: {self.expression_scores.get('progress', 0.0):.0%}"]
+        lines = [f"intensity: {self.expression_scores['overall']:.3f}"]
+        if self.args.expression_debug:
+            lines.extend(
+                [
+                    f"brow: {self.expression_scores['brow']:.3f}",
+                    f"eye: {self.expression_scores['eye']:.3f}",
+                    f"mouth: {self.expression_scores['mouth']:.3f}",
+                ]
+            )
+        return lines
 
     def trim(self, samples: list[np.ndarray]) -> list[np.ndarray]:
         x = np.vstack(samples)
@@ -640,7 +868,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--eth-xgaze-dir", default=str(ETH_XGAZE_DIR))
     parser.add_argument("--checkpoint", default=str(CHECKPOINT))
     parser.add_argument("--calibration", default=str(CALIBRATION_FILE))
-    parser.add_argument("--device", choices=["cpu", "cuda"], default="cpu")
+    parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
     parser.add_argument("--camera", type=int, default=0)
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
@@ -671,6 +899,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--emotion-interval-ms", type=int, default=150)
     parser.add_argument("--emotion-window", type=int, default=1)
     parser.add_argument("--emotion-debug", action="store_true")
+    parser.set_defaults(expression_intensity=False)
+    parser.add_argument("--expression-intensity", action="store_true")
+    parser.add_argument("--no-expression-intensity", dest="expression_intensity", action="store_false")
+    parser.add_argument("--expression-baseline-frames", type=int, default=45)
+    parser.add_argument("--expression-debug", action="store_true")
     parser.add_argument("--calibrate", action="store_true")
     parser.set_defaults(no_preview=True)
     parser.add_argument("--preview", dest="no_preview", action="store_false")

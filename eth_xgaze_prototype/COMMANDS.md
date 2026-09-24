@@ -13,9 +13,12 @@ run.bat
 run.bat --calibrate
 run.bat --emotion
 run.bat --calibrate --emotion
+run.bat --device auto
 run.bat --preview
 run.bat --preview --emotion
 run.bat --preview --emotion --emotion-debug
+run.bat --calibrate --expression-intensity
+run.bat --preview --expression-intensity --expression-debug
 run.bat --calibrate --calibration-camera-overlay
 ```
 
@@ -36,10 +39,21 @@ Emotion/facial-expression cue:
 ```bat
 python download_emotion_model.py
 run.bat --emotion
+run.bat --calibrate --emotion
 run.bat --preview --emotion
 run.bat --preview --emotion --emotion-debug
 run.bat --emotion --emotion-interval-ms 100
 run.bat --emotion --emotion-interval-ms 300
+```
+
+Landmark expression intensity:
+
+```bat
+run.bat --expression-intensity
+run.bat --calibrate --expression-intensity
+run.bat --preview --expression-intensity
+run.bat --preview --expression-intensity --expression-debug
+run.bat --expression-intensity --expression-baseline-frames 60
 ```
 
 Debug face detection:
@@ -69,7 +83,7 @@ run.bat --calibrate --head-weight 0.35
 | `--eth-xgaze-dir` | `C:\Users\ywinata_kadence\Documents\CV Code\eth-xgaze` | path | Official ETH-XGaze repo folder. |
 | `--checkpoint` | `...\ckpt\epoch_24_ckpt.pth.tar` | path | ETH-XGaze pretrained checkpoint. |
 | `--calibration` | `eth_xgaze_screen_calibration.json` | path | Calibration output/input file. |
-| `--device` | `cpu` | `cpu`, `cuda` | Use `cuda` only when GPU/Torch supports it. |
+| `--device` | `cpu` | `cpu`, `cuda`, `auto` | ETH-XGaze Torch device. `auto` uses CUDA only if Torch detects it. |
 | `--camera` | `0` | `0`, `1`, etc. | Webcam index. |
 | `--width` | `640` | `424`, `640`, `1280` | Camera capture width. Lower can be lighter. |
 | `--height` | `480` | `240`, `480`, `720` | Camera capture height. Lower can be lighter. |
@@ -97,7 +111,11 @@ run.bat --calibrate --head-weight 0.35
 | `--emotion-model` | `models\emotion-ferplus-12-int8.onnx` | path | FER+ ONNX model file. |
 | `--emotion-interval-ms` | `150` | `100`, `150`, `300` | Lower is more responsive, higher is lighter. |
 | `--emotion-window` | `1` | `1`, `3`, `5` | Majority-vote smoothing for emotion label. `1` follows the latest frame. |
-| `--emotion-debug` | off | flag | Shows every emotion label probability in preview/status. |
+| `--emotion-debug` | off | flag | Shows every emotion label probability plus positive/negative/valence in preview/status. |
+| `--expression-intensity` | off | flag | Enables landmark movement intensity from neutral baseline. |
+| `--no-expression-intensity` | on | flag | Disables landmark movement intensity. |
+| `--expression-baseline-frames` | `45` | `30`, `45`, `60` | Valid face frames used to build baseline. |
+| `--expression-debug` | off | flag | Shows `brow`, `eye`, and `mouth` region intensity. |
 | `--calibrate` | off | flag | Opens calibration mode. |
 | `--preview` | off | flag | Opens webcam preview window. |
 | `--no-preview` | on | flag | Keeps webcam preview hidden. |
@@ -132,6 +150,25 @@ Emotion detection, responsive default:
 
 ```bat
 run.bat --emotion --emotion-interval-ms 150 --emotion-window 1
+```
+
+Emotion model intensity:
+
+```text
+model_intensity = 1 - neutral_probability
+positive = happy_probability
+negative = sad + angry + disgust + fear
+valence = positive - negative
+```
+
+When `--calibrate --emotion` is used, the app captures median neutral emotion
+probabilities first and reports model intensity / valence deltas against that
+personal baseline.
+
+Landmark intensity plus emotion:
+
+```bat
+run.bat --preview --emotion --expression-intensity --expression-debug
 ```
 
 Emotion labels:

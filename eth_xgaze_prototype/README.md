@@ -62,6 +62,7 @@ run.bat --calibrate --feature-mode gaze_head
 run.bat --calibrate --head-weight 0.15
 run.bat --calibrate --min-eye-open 0.14
 run.bat --device cuda
+run.bat --device auto
 run.bat --width 424 --height 240
 run.bat --calibrate --face-upsample 2
 run.bat --calibrate --calibration-bg white
@@ -70,6 +71,8 @@ run.bat --preview
 run.bat --emotion
 run.bat --preview --emotion
 run.bat --preview --emotion --emotion-debug
+run.bat --calibrate --expression-intensity
+run.bat --preview --expression-intensity --expression-debug
 run.bat --emotion --emotion-interval-ms 100
 ```
 
@@ -111,9 +114,24 @@ Enable the lightweight FER+ ONNX mode with `--emotion`; it updates at most every
 `150 ms` by default. Use `--emotion-interval-ms 100` for stronger PCs or
 `--emotion-interval-ms 300` if the laptop feels heavy. Labels are `neutral`,
 `happy`, `surprise`, `sad`, `angry`, `disgust`, `fear`, and `contempt`.
+Emotion mode also reports model-based intensity as `1 - neutral_probability`,
+which is more tolerant of small head movement than landmark intensity but less
+physical/region-specific.
 By default the UI shows the latest winning label without majority smoothing; add
 `--emotion-debug` to show all label probabilities in the preview/status for
 tuning.
+When used with `--calibrate`, the neutral baseline screen also captures median
+emotion probabilities, so model intensity and valence can be shown as deltas
+from the user's own neutral face.
+
+Optional landmark expression intensity is also off by default. Enable it with
+`--expression-intensity`; the first `45` valid face frames build a neutral
+baseline, then the app reports how far aligned landmarks move away from that
+baseline. Add `--expression-debug` to show `brow`, `eye`, and `mouth` region
+scores in the preview. This is a movement/intensity cue, not an emotion label.
+When used with `--calibrate`, the neutral expression baseline is captured first:
+look at the center, keep your head still, relax your face, then the red-dot gaze
+calibration starts.
 
 If calibration says `face not detected`, make sure the physical camera switch is
 on, try brighter front lighting, keep your face centered in the webcam, or run
