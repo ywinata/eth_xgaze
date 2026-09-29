@@ -63,11 +63,17 @@ run.bat --calibrate --head-weight 0.15
 run.bat --calibrate --min-eye-open 0.14
 run.bat --device cuda
 run.bat --device auto
+run.bat --screen 1
+run.bat --camera 1
 run.bat --width 424 --height 240
 run.bat --calibrate --face-upsample 2
 run.bat --calibrate --calibration-bg white
 run.bat --calibrate --calibration-camera-overlay
 run.bat --preview
+run.bat --preview --preview-scale 1.5
+run.bat --preview --record-preview
+run.bat --preview --record-metrics
+run.bat --preview --record-preview --record-metrics
 run.bat --emotion
 run.bat --preview --emotion
 run.bat --preview --emotion --emotion-debug
@@ -105,6 +111,12 @@ The calibration screen defaults to a black background with dim status text. This
 keeps 49-dot calibration less distracting, so your attention can stay on the red
 target.
 
+When `--preview` is enabled, use `Start Recording` and `Stop & Save` in the
+control window to manually save a debug clip and metrics CSV together. Add
+`--record-preview` for automatic video recording and `--record-metrics` for
+automatic CSV metrics recording. Outputs overwrite `preview_recording.mp4` and
+`preview_metrics.csv`; the video includes preview scale and overlay.
+
 Calibration samples are collected only when the face is detected, ETH-XGaze runs,
 and both eyes are open enough. If normal open eyes are rejected too often, lower
 the threshold slightly with `--min-eye-open 0.14`.
@@ -120,15 +132,17 @@ physical/region-specific.
 By default the UI shows the latest winning label without majority smoothing; add
 `--emotion-debug` to show all label probabilities in the preview/status for
 tuning.
-When used with `--calibrate`, the neutral baseline screen also captures median
-emotion probabilities, so model intensity and valence can be shown as deltas
-from the user's own neutral face.
+When used with `--calibrate`, the neutral baseline screen also captures personal
+resting-face emotion statistics, so model intensity and valence can be shown as
+baseline-relative change instead of only absolute model probabilities.
 
 Optional landmark expression intensity is also off by default. Enable it with
 `--expression-intensity`; the first `45` valid face frames build a neutral
 baseline, then the app reports how far aligned landmarks move away from that
-baseline. Add `--expression-debug` to show `brow`, `eye`, and `mouth` region
-scores in the preview. This is a movement/intensity cue, not an emotion label.
+baseline. The left preview overlay shows user-facing summary labels without
+delta/sigma. The right overlay keeps development details: emotion model output,
+emotion probabilities, landmark intensity, delta, and sigma values for tuning.
+This is a movement/intensity cue, not an emotion label.
 When used with `--calibrate`, the neutral expression baseline is captured first:
 look at the center, keep your head still, relax your face, then the red-dot gaze
 calibration starts.

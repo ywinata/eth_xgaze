@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import ctypes
+from ctypes import wintypes
 import json
 import os
 import sys
@@ -47,12 +49,92 @@ EMOTION_LABELS = ("neutral", "happy", "surprise", "sad", "angry", "disgust", "fe
 NEGATIVE_EMOTION_LABELS = ("sad", "angry", "disgust", "fear")
 MODEL_VERSION = 4
 PREVIEW_WINDOW = "ETH-XGaze camera preview"
+PREVIEW_RECORDING_FILE = Path("preview_recording.mp4")
+PREVIEW_RECORDING_FPS = 20.0
+METRICS_FILE = Path("preview_metrics.csv")
+METRICS_FIELDS = [
+    "timestamp_s",
+    "frame_index",
+    "face_detected",
+    "gaze_x",
+    "gaze_y",
+    "pitch",
+    "yaw",
+    "eye_open",
+    "emotion_label",
+    "emotion_intensity",
+    "emotion_intensity_delta",
+    "emotion_intensity_sigma",
+    "valence",
+    "valence_delta",
+    "valence_sigma",
+    "positive",
+    "negative",
+    "neutral_prob",
+    "happy_prob",
+    "surprise_prob",
+    "sad_prob",
+    "angry_prob",
+    "disgust_prob",
+    "fear_prob",
+    "contempt_prob",
+    "expression_overall",
+    "expression_overall_sigma",
+    "brow_sigma",
+    "eye_sigma",
+    "mouth_sigma",
+]
 
 
-def screen_size(root: tk.Tk) -> tuple[int, int]:
-    if sys.platform == "win32":
-        return ctypes.windll.user32.GetSystemMetrics(0), ctypes.windll.user32.GetSystemMetrics(1)
-    return root.winfo_screenwidth(), root.winfo_screenheight()
+def list_screens(root: tk.Tk) -> list[dict[str, int | bool]]:
+    if sys.platform != "win32":
+        return [{"x": 0, "y": 0, "w": root.winfo_screenwidth(), "h": root.winfo_screenheight(), "primary": True}]
+
+    monitors: list[dict[str, int | bool]] = []
+
+    class MONITORINFO(ctypes.Structure):
+        _fields_ = [("cbSize", wintypes.DWORD), ("rcMonitor", wintypes.RECT), ("rcWork", wintypes.RECT), ("dwFlags", wintypes.DWORD)]
+
+    def callback(handle, _dc, _rect, _data):
+        info = MONITORINFO()
+        info.cbSize = ctypes.sizeof(MONITORINFO)
+        ctypes.windll.user32.GetMonitorInfoW(handle, ctypes.byref(info))
+        rect = info.rcMonitor
+        monitors.append(
+            {
+                "x": int(rect.left),
+                "y": int(rect.top),
+                "w": int(rect.right - rect.left),
+                "h": int(rect.bottom - rect.top),
+                "primary": bool(info.dwFlags & 1),
+            }
+        )
+        return True
+
+    monitor_enum_proc = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HMONITOR, wintypes.HDC, ctypes.POINTER(wintypes.RECT), wintypes.LPARAM)
+    ctypes.windll.user32.EnumDisplayMonitors(0, 0, monitor_enum_proc(callback), 0)
+    return monitors or [{"x": 0, "y": 0, "w": root.winfo_screenwidth(), "h": root.winfo_screenheight(), "primary": True}]
+
+
+def select_screen(root: tk.Tk, value: str) -> dict[str, int | bool]:
+    screens = list_screens(root)
+    raw = str(value).strip().lower()
+    if raw == "auto":
+        return next((screen for screen in screens if screen["primary"]), screens[0])
+    try:
+        return screens[int(raw)]
+    except (ValueError, IndexError):
+        return screens[0]
+
+
+def resolve_camera_index(value: str) -> int:
+    raw = str(value).strip().lower()
+    if raw == "auto":
+        return 0
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return 0
 
 
 def find_haar_cascade() -> Optional[Path]:
@@ -289,12 +371,14 @@ class LandmarkExpressionIntensity:
         self.samples: deque[np.ndarray] = deque(maxlen=self.baseline_frames)
         self.baseline: Optional[np.ndarray] = None
         self.face_width = 1.0
+        self.baseline_stats: dict[str, tuple[float, float]] = {}
         self.last_scores: dict[str, float] = {}
 
     def reset(self) -> None:
         self.samples.clear()
         self.baseline = None
         self.face_width = 1.0
+        self.baseline_stats = {}
         self.last_scores = {}
 
     def update(self, landmarks: np.ndarray) -> dict[str, float]:
@@ -304,15 +388,31 @@ class LandmarkExpressionIntensity:
             if len(self.samples) == self.samples.maxlen:
                 self.baseline = np.median(np.stack(self.samples), axis=0).astype(np.float32)
                 self.face_width = max(float(np.linalg.norm(self.baseline[0] - self.baseline[16])), 1.0)
+                sample_scores = [self.score(sample) for sample in self.samples]
+                self.baseline_stats = {
+                    key: (
+                        float(np.median([scores[key] for scores in sample_scores])),
+                        max(float(np.std([scores[key] for scores in sample_scores])), 1e-3),
+                    )
+                    for key in ["overall", *self.REGIONS.keys()]
+                }
             self.last_scores = {"ready": 0.0, "progress": len(self.samples) / float(self.samples.maxlen)}
             return self.last_scores
 
+        scores = self.score(points)
+        scores["ready"] = 1.0
+        for key, (center, noise) in self.baseline_stats.items():
+            scores[f"{key}_delta"] = scores[key] - center
+            scores[f"{key}_sigma"] = (scores[key] - center) / noise
+        self.last_scores = scores
+        return scores
+
+    def score(self, points: np.ndarray) -> dict[str, float]:
         affine, _ = cv2.estimateAffinePartial2D(points[self.ANCHORS], self.baseline[self.ANCHORS], method=cv2.LMEDS)
         aligned = cv2.transform(points.reshape(1, -1, 2), affine).reshape(-1, 2) if affine is not None else points
         residual = np.linalg.norm(aligned - self.baseline, axis=1) / self.face_width
-        scores = {"ready": 1.0, "overall": float(np.mean(residual[17:68]))}
+        scores = {"overall": float(np.mean(residual[17:68]))}
         scores.update({name: float(np.mean(residual[indexes])) for name, indexes in self.REGIONS.items()})
-        self.last_scores = scores
         return scores
 
 
@@ -321,9 +421,13 @@ class App:
         self.args = args
         self.root = tk.Tk()
         self.root.title("ETH-XGaze Prototype")
-        self.root.geometry("420x180")
-        self.screen_w, self.screen_h = screen_size(self.root)
-        self.capture = cv2.VideoCapture(args.camera, cv2.CAP_DSHOW)
+        self.root.geometry("560x240")
+        self.root.minsize(560, 240)
+        self.screen = select_screen(self.root, args.screen)
+        self.screen_x, self.screen_y = int(self.screen["x"]), int(self.screen["y"])
+        self.screen_w, self.screen_h = int(self.screen["w"]), int(self.screen["h"])
+        self.camera_index = resolve_camera_index(args.camera)
+        self.capture = cv2.VideoCapture(self.camera_index, cv2.CAP_DSHOW)
         self.capture.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
         self.capture.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         self.capture.set(cv2.CAP_PROP_FPS, 30)
@@ -351,10 +455,31 @@ class App:
             self.status.set(f"ETH-XGaze calibration loaded. Device: {self.core.device_note}.")
         if self.emotion_error:
             self.status.set(self.emotion_error)
+        self.preview_writer: Optional[cv2.VideoWriter] = None
+        self.preview_recording_active = bool(args.record_preview)
+        self.metrics_file = None
+        self.metrics_writer: Optional[csv.DictWriter] = None
+        self.metrics_recording_active = bool(args.record_metrics)
+        self.last_metrics_at = 0.0
+        self.frame_index = 0
+        self.latest_face_detected = False
+        self.latest_gaze_xy: tuple[Optional[int], Optional[int]] = (None, None)
+        self.latest_pitch_yaw: tuple[Optional[float], Optional[float]] = (None, None)
+        self.latest_eye_open: Optional[float] = None
+        self.preview_window_size: Optional[tuple[int, int]] = None
+        self.preview_window_maximized = False
+        self.preview_window_created = False
+        self.stopped = False
         tk.Label(self.root, text="ETH-XGaze Prototype", font=("Segoe UI", 13, "bold")).pack(pady=(12, 4))
-        tk.Label(self.root, textvariable=self.status, wraplength=380).pack()
-        tk.Button(self.root, text="Calibrate", command=self.start_calibration).pack(side=tk.LEFT, padx=32, pady=18)
-        tk.Button(self.root, text="Quit", command=self.stop).pack(side=tk.RIGHT, padx=32, pady=18)
+        buttons = tk.Frame(self.root)
+        buttons.pack(pady=(8, 10))
+        tk.Button(buttons, text="Calibrate", command=self.start_calibration).pack(side=tk.LEFT, padx=6)
+        self.record_start_button = tk.Button(buttons, text="Start Recording", command=self.start_preview_recording)
+        self.record_start_button.pack(side=tk.LEFT, padx=6)
+        self.record_stop_button = tk.Button(buttons, text="Stop & Save", command=self.stop_preview_recording)
+        self.record_stop_button.pack(side=tk.LEFT, padx=6)
+        tk.Button(buttons, text="Quit", command=self.stop).pack(side=tk.LEFT, padx=6)
+        tk.Label(self.root, textvariable=self.status, wraplength=520, height=5, justify=tk.CENTER).pack(fill=tk.X, padx=16)
         self.calibration_screen: Optional[tk.Toplevel] = None
         self.calibration_phase = "gaze"
         self.canvas: Optional[tk.Canvas] = None
@@ -377,13 +502,17 @@ class App:
         self.emotion_valence = 0.0
         self.emotion_intensity_delta = 0.0
         self.emotion_valence_delta = 0.0
+        self.emotion_intensity_sigma = 0.0
+        self.emotion_valence_sigma = 0.0
         self.emotion_baseline_samples: list[dict[str, float]] = []
         self.emotion_baseline_probs: dict[str, float] = {}
+        self.emotion_baseline_stats: dict[str, tuple[float, float]] = {}
         self.expression_intensity: Optional[LandmarkExpressionIntensity] = (
             LandmarkExpressionIntensity(args.expression_baseline_frames) if args.expression_intensity else None
         )
         self.expression_scores: dict[str, float] = {}
         self.camera_image = None
+        self.update_recording_buttons()
         if args.calibrate:
             self.root.after(500, self.start_calibration)
         self.root.after(10, self.tick)
@@ -394,11 +523,19 @@ class App:
         self.root.mainloop()
 
     def stop(self) -> None:
+        if self.stopped:
+            return
+        self.stopped = True
         self.pointer.hide()
+        self.close_preview_writer()
+        self.close_metrics_writer()
         self.capture.release()
         if not self.args.no_preview:
             cv2.destroyAllWindows()
-        self.root.destroy()
+        try:
+            self.root.destroy()
+        except tk.TclError:
+            pass
 
     def handle_escape(self, _event=None) -> None:
         if self.calibration_screen:
@@ -418,6 +555,41 @@ class App:
             self.canvas = None
         self.root.deiconify()
 
+    def start_preview_recording(self) -> None:
+        if self.args.no_preview:
+            self.status.set("Enable --preview before recording preview.")
+            return
+        self.close_preview_writer()
+        self.close_metrics_writer()
+        self.preview_recording_active = True
+        self.metrics_recording_active = True
+        self.update_recording_buttons()
+        self.status.set(f"Recording preview/metrics to {PREVIEW_RECORDING_FILE} and {self.args.metrics_file}.")
+
+    def stop_preview_recording(self) -> None:
+        was_recording = (
+            self.preview_recording_active
+            or self.preview_writer is not None
+            or self.metrics_recording_active
+            or self.metrics_writer is not None
+        )
+        self.preview_recording_active = False
+        self.metrics_recording_active = False
+        self.close_preview_writer()
+        self.close_metrics_writer()
+        self.update_recording_buttons()
+        if was_recording:
+            self.status.set(f"Saved recording: {PREVIEW_RECORDING_FILE}; metrics: {self.args.metrics_file}.")
+
+    def update_recording_buttons(self) -> None:
+        if self.args.no_preview:
+            self.record_start_button.config(state=tk.DISABLED)
+            self.record_stop_button.config(state=tk.DISABLED)
+            return
+        active = self.preview_recording_active or self.metrics_recording_active
+        self.record_start_button.config(state=tk.DISABLED if active else tk.NORMAL)
+        self.record_stop_button.config(state=tk.NORMAL if active else tk.DISABLED)
+
     def load_calibration(self) -> Optional[np.ndarray]:
         path = Path(self.args.calibration)
         if not path.exists():
@@ -426,6 +598,7 @@ class App:
         if (
             data.get("version") != MODEL_VERSION
             or data.get("screen_size") != [self.screen_w, self.screen_h]
+            or data.get("screen_origin", [0, 0]) != [self.screen_x, self.screen_y]
             or data.get("feature_mode") != self.args.feature_mode
             or float(data.get("head_weight", self.args.head_weight)) != float(self.args.head_weight)
         ):
@@ -441,6 +614,7 @@ class App:
         data = {
             "version": MODEL_VERSION,
             "screen_size": [self.screen_w, self.screen_h],
+            "screen_origin": [self.screen_x, self.screen_y],
             "weights": self.weights.tolist(),
             "feature_mean": self.feature_mean.tolist(),
             "feature_std": self.feature_std.tolist(),
@@ -465,7 +639,7 @@ class App:
         self.calibration_screen = tk.Toplevel(self.root)
         self.calibration_screen.overrideredirect(True)
         self.calibration_screen.configure(bg=self.args.calibration_bg)
-        self.calibration_screen.geometry(f"{self.screen_w}x{self.screen_h}+0+0")
+        self.calibration_screen.geometry(f"{self.screen_w}x{self.screen_h}+{self.screen_x}+{self.screen_y}")
         self.calibration_screen.attributes("-topmost", True)
         self.canvas = tk.Canvas(
             self.calibration_screen,
@@ -636,48 +810,259 @@ class App:
         return np.hstack([np.ones((features.shape[0], 1), dtype=np.float32), features, features[:, :2] ** 2])
 
     def tick(self) -> None:
+        if self.stopped:
+            return
         ok, frame = self.capture.read()
         if ok:
             frame = cv2.flip(frame, 1)
             self.handle_frame(frame)
+            self.write_metrics_record()
             if not self.args.no_preview and not self.calibration_screen:
-                self.draw_preview_overlay(frame)
-                cv2.imshow(PREVIEW_WINDOW, frame)
+                if self.preview_was_closed():
+                    self.stop()
+                    return
+                preview = self.make_preview_frame(frame)
+                self.draw_preview_overlay(preview)
+                self.write_preview_recording(preview)
+                self.resize_preview_window(preview)
+                cv2.imshow(PREVIEW_WINDOW, preview)
+                self.maximize_preview_window()
                 cv2.waitKey(1)
-        self.root.after(16, self.tick)
+                if self.preview_was_closed():
+                    self.stop()
+                    return
+        if not self.stopped:
+            self.root.after(16, self.tick)
+
+    def preview_was_closed(self) -> bool:
+        if not self.preview_window_created:
+            return False
+        try:
+            return cv2.getWindowProperty(PREVIEW_WINDOW, cv2.WND_PROP_VISIBLE) < 1
+        except cv2.error:
+            return True
+
+    def maximize_preview_window(self) -> None:
+        if self.preview_window_maximized or sys.platform != "win32":
+            return
+        hwnd = ctypes.windll.user32.FindWindowW(None, PREVIEW_WINDOW)
+        if hwnd:
+            ctypes.windll.user32.ShowWindow(hwnd, 3)
+            self.preview_window_maximized = True
+
+    def resize_preview_window(self, frame: np.ndarray) -> None:
+        height, width = frame.shape[:2]
+        size = (width, height)
+        if self.preview_window_size == size:
+            return
+        self.preview_window_size = size
+        cv2.namedWindow(PREVIEW_WINDOW, cv2.WINDOW_NORMAL)
+        self.preview_window_created = True
+        cv2.resizeWindow(PREVIEW_WINDOW, width, height)
+        x = self.screen_x + max(0, (self.screen_w - width) // 2)
+        y = self.screen_y + max(0, (self.screen_h - height) // 2)
+        cv2.moveWindow(PREVIEW_WINDOW, x, y)
+
+    def write_preview_recording(self, frame: np.ndarray) -> None:
+        if not self.preview_recording_active:
+            return
+        if self.preview_writer is None:
+            height, width = frame.shape[:2]
+            fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+            self.preview_writer = cv2.VideoWriter(
+                str(PREVIEW_RECORDING_FILE),
+                fourcc,
+                PREVIEW_RECORDING_FPS,
+                (width, height),
+            )
+        if self.preview_writer.isOpened():
+            self.preview_writer.write(frame)
+        else:
+            self.preview_recording_active = False
+            self.update_recording_buttons()
+            self.status.set(f"Could not write preview recording: {PREVIEW_RECORDING_FILE}.")
+
+    def close_preview_writer(self) -> None:
+        if self.preview_writer is not None:
+            self.preview_writer.release()
+            self.preview_writer = None
+
+    def write_metrics_record(self) -> None:
+        if not self.metrics_recording_active:
+            return
+        now = time.perf_counter()
+        if (now - self.last_metrics_at) * 1000.0 < self.args.metrics_interval_ms:
+            return
+        self.last_metrics_at = now
+        if self.metrics_writer is None:
+            self.metrics_file = open(self.args.metrics_file, "w", newline="", encoding="utf-8")
+            self.metrics_writer = csv.DictWriter(self.metrics_file, fieldnames=METRICS_FIELDS)
+            self.metrics_writer.writeheader()
+        gaze_x, gaze_y = self.latest_gaze_xy
+        pitch, yaw = self.latest_pitch_yaw
+        row = {
+            "timestamp_s": f"{time.time():.3f}",
+            "frame_index": self.frame_index,
+            "face_detected": int(self.latest_face_detected),
+            "gaze_x": "" if gaze_x is None else gaze_x,
+            "gaze_y": "" if gaze_y is None else gaze_y,
+            "pitch": "" if pitch is None else f"{pitch:.6f}",
+            "yaw": "" if yaw is None else f"{yaw:.6f}",
+            "eye_open": "" if self.latest_eye_open is None else f"{self.latest_eye_open:.6f}",
+            "emotion_label": self.emotion_label if self.emotion is not None else "",
+            "emotion_intensity": f"{self.emotion_intensity:.6f}",
+            "emotion_intensity_delta": f"{self.emotion_intensity_delta:.6f}",
+            "emotion_intensity_sigma": f"{self.emotion_intensity_sigma:.6f}",
+            "valence": f"{self.emotion_valence:.6f}",
+            "valence_delta": f"{self.emotion_valence_delta:.6f}",
+            "valence_sigma": f"{self.emotion_valence_sigma:.6f}",
+            "positive": f"{self.emotion_positive:.6f}",
+            "negative": f"{self.emotion_negative:.6f}",
+            "expression_overall": self.format_metric("overall"),
+            "expression_overall_sigma": self.format_metric("overall_sigma"),
+            "brow_sigma": self.format_metric("brow_sigma"),
+            "eye_sigma": self.format_metric("eye_sigma"),
+            "mouth_sigma": self.format_metric("mouth_sigma"),
+        }
+        for label in EMOTION_LABELS:
+            row[f"{label}_prob"] = f"{self.emotion_probs.get(label, 0.0):.6f}"
+        self.metrics_writer.writerow(row)
+        if self.metrics_file is not None:
+            self.metrics_file.flush()
+
+    def format_metric(self, key: str) -> str:
+        if not self.expression_scores or key not in self.expression_scores:
+            return ""
+        return f"{self.expression_scores[key]:.6f}"
+
+    def close_metrics_writer(self) -> None:
+        if self.metrics_file is not None:
+            self.metrics_file.close()
+            self.metrics_file = None
+            self.metrics_writer = None
+
+    def preview_scale(self, frame: np.ndarray) -> float:
+        raw = str(self.args.preview_scale).strip().lower()
+        if raw == "auto":
+            height, width = frame.shape[:2]
+            available_w = max(320, self.screen_w - 80)
+            available_h = max(240, self.screen_h - 180)
+            return max(0.25, min(2.0, available_w / width, available_h / height))
+        try:
+            return max(0.25, min(4.0, float(raw)))
+        except ValueError:
+            return 1.0
+
+    def make_preview_frame(self, frame: np.ndarray) -> np.ndarray:
+        scale = self.preview_scale(frame)
+        if abs(scale - 1.0) < 0.01:
+            return frame.copy()
+        height, width = frame.shape[:2]
+        size = (max(1, int(width * scale)), max(1, int(height * scale)))
+        return cv2.resize(frame, size, interpolation=cv2.INTER_LINEAR)
 
     def draw_preview_overlay(self, frame: np.ndarray) -> None:
         if self.emotion is None and self.expression_intensity is None:
             return
-        lines = []
+        rows: list[list[str]] = []
         if self.emotion is not None:
-            lines.append(f"emotion: {self.emotion_label}")
-            lines.append(f"emotion intensity: {self.emotion_intensity:.0%}")
+            intensity = f"{self.emotion_intensity:.0%}"
             if self.emotion_baseline_probs:
-                lines.append(f"emotion delta: {self.emotion_intensity_delta:+.0%}")
+                intensity = f"{intensity} ({self.emotion_intensity_delta:+.0%})"
+            rows.append(["EMOTION SUMMARY"])
+            rows.append(["emotion", self.emotion_label, "intensity", intensity])
         if self.emotion is not None and self.args.emotion_debug and self.emotion_probs:
-            lines.extend(
+            rows.extend(
                 [
-                    f"positive: {self.emotion_positive:.0%}",
-                    f"negative: {self.emotion_negative:.0%}",
-                    f"valence: {self.emotion_valence:+.2f}",
-                    f"valence delta: {self.emotion_valence_delta:+.2f}",
+                    ["EMOTION PROBABILITY"],
+                    ["valence", f"{self.emotion_valence:+.2f}", "delta", f"{self.emotion_valence_delta:+.2f}"],
+                    ["positive", f"{self.emotion_positive:.0%}", "negative", f"{self.emotion_negative:.0%}"],
+                    ["neutral", f"{self.emotion_probs['neutral']:.0%}", "happy", f"{self.emotion_probs['happy']:.0%}"],
+                    ["surprise", f"{self.emotion_probs['surprise']:.0%}", "sad", f"{self.emotion_probs['sad']:.0%}"],
+                    ["angry", f"{self.emotion_probs['angry']:.0%}", "disgust", f"{self.emotion_probs['disgust']:.0%}"],
+                    ["fear", f"{self.emotion_probs['fear']:.0%}", "contempt", f"{self.emotion_probs['contempt']:.0%}"],
                 ]
             )
-            lines.extend(f"{label}: {self.emotion_probs[label]:.0%}" for label in EMOTION_LABELS)
         if self.expression_intensity is not None:
-            lines.extend(self.format_expression_lines())
-        if not lines:
+            rows.append(["LANDMARK INTENSITY"])
+            rows.extend(self.format_expression_rows())
+        user_rows = self.user_overlay_rows()
+        if not rows and not user_rows:
             return
-        width = 360 if self.expression_intensity is not None else 260
-        height = 18 + 25 * len(lines)
-        cv2.rectangle(frame, (8, 8), (width, height), (0, 0, 0), -1)
-        for i, text in enumerate(lines):
-            cv2.putText(frame, text, (16, 32 + i * 25), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (80, 255, 255), 2, cv2.LINE_AA)
+        if user_rows:
+            self.draw_overlay_panel(frame, user_rows, "left")
+        if rows:
+            self.draw_overlay_panel(frame, rows, "right")
+
+    def user_overlay_rows(self) -> list[list[str]]:
+        rows: list[list[str]] = [["USER SUMMARY"]]
+        if self.emotion is not None:
+            rows.append(["emotion", self.emotion_label, "", ""])
+            if self.emotion_baseline_stats:
+                rows.append(["valence", self.valence_label(self.emotion_valence_sigma), "", ""])
+                rows.append(["emotion intensity", self.change_label(self.emotion_intensity_sigma), "", ""])
+            else:
+                rows.append(["emotion baseline", "collecting", "", ""])
+        if self.expression_intensity is not None:
+            if not self.expression_scores:
+                rows.append(["expression baseline", "waiting", "", ""])
+            elif not self.expression_scores.get("ready", 0.0):
+                rows.append(["expression baseline", f"{self.expression_scores.get('progress', 0.0):.0%}", "", ""])
+            else:
+                rows.extend(
+                    [
+                        ["expression", self.change_label(self.expression_scores.get("overall_sigma", 0.0)), "", ""],
+                        ["brow", self.change_label(self.expression_scores.get("brow_sigma", 0.0)), "eye", self.change_label(self.expression_scores.get("eye_sigma", 0.0))],
+                        ["mouth", self.change_label(self.expression_scores.get("mouth_sigma", 0.0)), "", ""],
+                    ]
+                )
+        return rows if len(rows) > 1 else []
+
+    def draw_overlay_panel(self, frame: np.ndarray, rows: list[list[str]], side: str) -> None:
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        font_scale = 0.5
+        thickness = 1
+        line_height = 21
+        col_gap = 26
+        normalized_rows = [row + [""] * (4 - len(row)) for row in rows]
+        col_widths = [
+            max(cv2.getTextSize(row[col], font, font_scale, thickness)[0][0] for row in normalized_rows)
+            for col in range(4)
+        ]
+        panel_w = min(frame.shape[1] - 20, max(300 if side == "left" else 400, sum(col_widths) + col_gap + 32))
+        panel_h = 16 + line_height * len(rows)
+        x0 = 10 if side == "left" else max(10, frame.shape[1] - panel_w - 10)
+        y0 = 10
+        col_x = [
+            x0 + 12,
+            x0 + 12 + col_widths[0] + 12,
+            x0 + 12 + col_widths[0] + col_widths[1] + col_gap,
+            x0 + 12 + col_widths[0] + col_widths[1] + col_widths[2] + col_gap + 12,
+        ]
+        overlay = frame.copy()
+        cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.72, frame, 0.28, 0, frame)
+        for i, row in enumerate(normalized_rows):
+            y = y0 + 23 + i * line_height
+            if len(rows[i]) == 1:
+                cv2.putText(frame, row[0], (x0 + 12, y), font, font_scale, (160, 255, 255), thickness, cv2.LINE_AA)
+                continue
+            for text, x in zip(row, col_x):
+                if text:
+                    cv2.putText(frame, text, (x, y), font, font_scale, (80, 255, 255), thickness, cv2.LINE_AA)
 
     def handle_frame(self, frame: np.ndarray) -> None:
+        self.frame_index += 1
+        self.latest_face_detected = False
+        self.latest_gaze_xy = (None, None)
+        self.latest_pitch_yaw = (None, None)
+        self.latest_eye_open = None
         result = self.core.estimate(frame)
         valid = result is not None
+        if valid:
+            self.latest_face_detected = True
+            self.latest_pitch_yaw = (float(result[1][0]), float(result[1][1]))
+            self.latest_eye_open = float(result[4])
         if self.calibration_screen:
             elapsed = time.time() - self.target_started
             eye_quality = result[4] if result is not None else 0.0
@@ -735,7 +1120,8 @@ class App:
             x = int(np.median([p[0] for p in self.history]))
             y = int(np.median([p[1] for p in self.history]))
         x, y = self.smooth(x, y)
-        self.pointer.move(x, y)
+        self.latest_gaze_xy = (x, y)
+        self.pointer.move(self.screen_x + x, self.screen_y + y)
         suffix = f" | emotion: {self.format_emotion_status(expression)}" if expression else ""
         suffix += self.format_expression_status()
         self.status.set(f"ETH-XGaze pitch/yaw: {result[1][0]:+.3f}, {result[1][1]:+.3f} ({result[3]}) -> x={x} y={y}{suffix}")
@@ -769,15 +1155,16 @@ class App:
         self.emotion_positive = self.emotion_probs.get("happy", 0.0)
         self.emotion_negative = sum(self.emotion_probs.get(label, 0.0) for label in NEGATIVE_EMOTION_LABELS)
         self.emotion_valence = self.emotion_positive - self.emotion_negative
-        if self.emotion_baseline_probs:
-            baseline_intensity = 1.0 - self.emotion_baseline_probs.get("neutral", 0.0)
-            baseline_positive = self.emotion_baseline_probs.get("happy", 0.0)
-            baseline_negative = sum(self.emotion_baseline_probs.get(label, 0.0) for label in NEGATIVE_EMOTION_LABELS)
-            self.emotion_intensity_delta = self.emotion_intensity - baseline_intensity
-            self.emotion_valence_delta = self.emotion_valence - (baseline_positive - baseline_negative)
+        if self.emotion_baseline_stats:
+            self.emotion_intensity_delta = self.emotion_intensity - self.emotion_baseline_stats["intensity"][0]
+            self.emotion_valence_delta = self.emotion_valence - self.emotion_baseline_stats["valence"][0]
+            self.emotion_intensity_sigma = self.emotion_intensity_delta / self.emotion_baseline_stats["intensity"][1]
+            self.emotion_valence_sigma = self.emotion_valence_delta / self.emotion_baseline_stats["valence"][1]
         else:
             self.emotion_intensity_delta = 0.0
             self.emotion_valence_delta = 0.0
+            self.emotion_intensity_sigma = 0.0
+            self.emotion_valence_sigma = 0.0
 
     def needs_neutral_baseline(self) -> bool:
         return self.expression_intensity is not None or self.emotion is not None
@@ -785,8 +1172,11 @@ class App:
     def reset_emotion_baseline(self) -> None:
         self.emotion_baseline_samples = []
         self.emotion_baseline_probs = {}
+        self.emotion_baseline_stats = {}
         self.emotion_intensity_delta = 0.0
         self.emotion_valence_delta = 0.0
+        self.emotion_intensity_sigma = 0.0
+        self.emotion_valence_sigma = 0.0
 
     def update_emotion_baseline(self, frame: np.ndarray, face: dlib.rectangle) -> None:
         if self.emotion is None or len(self.emotion_baseline_samples) >= self.args.expression_baseline_frames:
@@ -800,6 +1190,25 @@ class App:
         self.emotion_baseline_probs = {
             label: float(np.median([sample.get(label, 0.0) for sample in self.emotion_baseline_samples]))
             for label in EMOTION_LABELS
+        }
+        baseline_metrics = [self.emotion_metrics(sample) for sample in self.emotion_baseline_samples]
+        self.emotion_baseline_stats = {
+            key: (
+                float(np.median([metrics[key] for metrics in baseline_metrics])),
+                max(float(np.std([metrics[key] for metrics in baseline_metrics])), 1e-3),
+            )
+            for key in ["intensity", "valence", "positive", "negative"]
+        }
+
+    @staticmethod
+    def emotion_metrics(probs: dict[str, float]) -> dict[str, float]:
+        positive = probs.get("happy", 0.0)
+        negative = sum(probs.get(label, 0.0) for label in NEGATIVE_EMOTION_LABELS)
+        return {
+            "intensity": max(0.0, min(1.0, 1.0 - probs.get("neutral", 0.0))),
+            "positive": positive,
+            "negative": negative,
+            "valence": positive - negative,
         }
 
     def neutral_baseline_progress(self) -> float:
@@ -819,6 +1228,25 @@ class App:
     def format_percent_delta(value: float, delta: float) -> str:
         return f"{value:.0%} ({delta:+.0%})"
 
+    @staticmethod
+    def change_label(sigma: float) -> str:
+        value = abs(sigma)
+        if value < 1.0:
+            return "stable"
+        if value < 2.0:
+            return "slight"
+        if value < 3.0:
+            return "moderate"
+        return "strong"
+
+    @staticmethod
+    def valence_label(sigma: float) -> str:
+        if abs(sigma) < 1.0:
+            return "stable"
+        direction = "more positive" if sigma > 0 else "more negative"
+        strength = App.change_label(sigma)
+        return f"{strength} {direction}"
+
     def update_expression_intensity(self, landmarks: np.ndarray) -> None:
         if self.expression_intensity is not None:
             self.expression_scores = self.expression_intensity.update(landmarks)
@@ -830,21 +1258,17 @@ class App:
             return f" | expression baseline {self.expression_scores.get('progress', 0.0):.0%}"
         return f" | intensity {self.expression_scores['overall']:.3f}"
 
-    def format_expression_lines(self) -> list[str]:
+    def format_expression_rows(self) -> list[list[str]]:
         if not self.expression_scores:
-            return ["intensity: waiting"]
+            return [["baseline", "waiting", "", ""]]
         if not self.expression_scores.get("ready", 0.0):
-            return [f"intensity baseline: {self.expression_scores.get('progress', 0.0):.0%}"]
-        lines = [f"intensity: {self.expression_scores['overall']:.3f}"]
-        if self.args.expression_debug:
-            lines.extend(
-                [
-                    f"brow: {self.expression_scores['brow']:.3f}",
-                    f"eye: {self.expression_scores['eye']:.3f}",
-                    f"mouth: {self.expression_scores['mouth']:.3f}",
-                ]
-            )
-        return lines
+            return [["baseline", f"{self.expression_scores.get('progress', 0.0):.0%}", "", ""]]
+        return [
+            ["overall", self.change_label(self.expression_scores.get("overall_sigma", 0.0)), "sigma", f"{self.expression_scores.get('overall_sigma', 0.0):+.1f}"],
+            ["brow", self.change_label(self.expression_scores.get("brow_sigma", 0.0)), "sigma", f"{self.expression_scores.get('brow_sigma', 0.0):+.1f}"],
+            ["eye", self.change_label(self.expression_scores.get("eye_sigma", 0.0)), "sigma", f"{self.expression_scores.get('eye_sigma', 0.0):+.1f}"],
+            ["mouth", self.change_label(self.expression_scores.get("mouth_sigma", 0.0)), "sigma", f"{self.expression_scores.get('mouth_sigma', 0.0):+.1f}"],
+        ]
 
     def trim(self, samples: list[np.ndarray]) -> list[np.ndarray]:
         x = np.vstack(samples)
@@ -869,7 +1293,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", default=str(CHECKPOINT))
     parser.add_argument("--calibration", default=str(CALIBRATION_FILE))
     parser.add_argument("--device", choices=["cpu", "cuda", "auto"], default="cpu")
-    parser.add_argument("--camera", type=int, default=0)
+    parser.add_argument("--screen", default="auto")
+    parser.add_argument("--camera", default="auto")
     parser.add_argument("--width", type=int, default=640)
     parser.add_argument("--height", type=int, default=480)
     parser.add_argument("--face-upsample", type=int, default=1)
@@ -908,6 +1333,15 @@ def parse_args() -> argparse.Namespace:
     parser.set_defaults(no_preview=True)
     parser.add_argument("--preview", dest="no_preview", action="store_false")
     parser.add_argument("--no-preview", dest="no_preview", action="store_true")
+    parser.add_argument("--preview-scale", default="auto")
+    parser.set_defaults(record_preview=False)
+    parser.add_argument("--record-preview", action="store_true")
+    parser.add_argument("--no-record-preview", dest="record_preview", action="store_false")
+    parser.set_defaults(record_metrics=False)
+    parser.add_argument("--record-metrics", action="store_true")
+    parser.add_argument("--no-record-metrics", dest="record_metrics", action="store_false")
+    parser.add_argument("--metrics-file", default=str(METRICS_FILE))
+    parser.add_argument("--metrics-interval-ms", type=int, default=200)
     return parser.parse_args()
 
 

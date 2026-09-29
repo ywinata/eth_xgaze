@@ -6,5 +6,7 @@ __pycache__/
 venv/
 *.egg-info/
 eth_xgaze_screen_calibration.json
+eth_xgaze_prototype/preview_recording.mp4
+eth_xgaze_prototype/preview_metrics.csv
 models/
 ckpt/

@@ -14,7 +14,13 @@ run.bat --calibrate
 run.bat --emotion
 run.bat --calibrate --emotion
 run.bat --device auto
+run.bat --screen 1
+run.bat --camera 1
 run.bat --preview
+run.bat --preview --preview-scale 1.5
+run.bat --preview --record-preview
+run.bat --preview --record-metrics
+run.bat --preview --record-preview --record-metrics
 run.bat --preview --emotion
 run.bat --preview --emotion --emotion-debug
 run.bat --calibrate --expression-intensity
@@ -84,7 +90,8 @@ run.bat --calibrate --head-weight 0.35
 | `--checkpoint` | `...\ckpt\epoch_24_ckpt.pth.tar` | path | ETH-XGaze pretrained checkpoint. |
 | `--calibration` | `eth_xgaze_screen_calibration.json` | path | Calibration output/input file. |
 | `--device` | `cpu` | `cpu`, `cuda`, `auto` | ETH-XGaze Torch device. `auto` uses CUDA only if Torch detects it. |
-| `--camera` | `0` | `0`, `1`, etc. | Webcam index. |
+| `--screen` | `auto` | `auto`, `0`, `1`, etc. | Screen index. `auto` uses the primary display. |
+| `--camera` | `auto` | `auto`, `0`, `1`, etc. | Webcam index. `auto` uses the primary camera / index `0`. |
 | `--width` | `640` | `424`, `640`, `1280` | Camera capture width. Lower can be lighter. |
 | `--height` | `480` | `240`, `480`, `720` | Camera capture height. Lower can be lighter. |
 | `--face-upsample` | `1` | `0`, `1`, `2` | Higher may detect face better but costs CPU. |
@@ -115,10 +122,22 @@ run.bat --calibrate --head-weight 0.35
 | `--expression-intensity` | off | flag | Enables landmark movement intensity from neutral baseline. |
 | `--no-expression-intensity` | on | flag | Disables landmark movement intensity. |
 | `--expression-baseline-frames` | `45` | `30`, `45`, `60` | Valid face frames used to build baseline. |
-| `--expression-debug` | off | flag | Shows `brow`, `eye`, and `mouth` region intensity. |
+| `--expression-debug` | off | flag | Reserved for extra expression debugging; region intensity is shown whenever `--expression-intensity` is enabled. |
 | `--calibrate` | off | flag | Opens calibration mode. |
 | `--preview` | off | flag | Opens webcam preview window. |
 | `--no-preview` | on | flag | Keeps webcam preview hidden. |
+| `--preview-scale` | `auto` | `auto`, `1.0`, `1.5`, `2.0` | Scales only the preview window; model processing stays at camera resolution. |
+| `--record-preview` | off | flag | Automatically records preview frames to `preview_recording.mp4`. |
+| `--no-record-preview` | on | flag | Keeps preview recording manual. |
+| `--record-metrics` | off | flag | Automatically records gaze, emotion, and expression metrics to `preview_metrics.csv`. |
+| `--no-record-metrics` | on | flag | Keeps metrics recording manual. |
+| `--metrics-file` | `preview_metrics.csv` | path | CSV output path for metrics recording. |
+| `--metrics-interval-ms` | `200` | `100`, `200`, `500` | CSV sampling interval. Higher is lighter. |
+
+Preview has `Start Recording` and `Stop & Save` buttons for manual debugging.
+The same buttons start/stop both preview video and CSV metrics. `--record-preview`
+and `--record-metrics` start their outputs automatically. Outputs overwrite
+`preview_recording.mp4` and `preview_metrics.csv`.
 
 ## Presets
 
@@ -161,15 +180,19 @@ negative = sad + angry + disgust + fear
 valence = positive - negative
 ```
 
-When `--calibrate --emotion` is used, the app captures median neutral emotion
-probabilities first and reports model intensity / valence deltas against that
-personal baseline.
+When `--calibrate --emotion` is used, the app captures personal resting-face
+emotion statistics first and reports model intensity / valence changes against
+that baseline.
 
 Landmark intensity plus emotion:
 
 ```bat
 run.bat --preview --emotion --expression-intensity --expression-debug
 ```
+
+The left preview overlay shows user-facing summary labels without delta/sigma.
+The right overlay keeps development details: emotion summary, emotion
+probability, landmark intensity, delta, and sigma values for tuning.
 
 Emotion labels:
 
